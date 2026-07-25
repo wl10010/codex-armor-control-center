@@ -61,26 +61,70 @@ python .\codex56-control-center.py
 
 ### macOS
 
-首次运行，在终端进入项目目录后执行：
+支持 Intel Mac 和 Apple Silicon（M1/M2/M3/M4）。启动器使用自身所在目录作为工作目录，因此项目移动到其他位置后仍可正常运行。
+
+#### 1. 检查运行环境
+
+需要 Python 3.10 或更高版本，并且 Python 必须包含 Tkinter：
+
+```bash
+python3 --version
+python3 -c "import tkinter; print('Tkinter', tkinter.TkVersion)"
+```
+
+如果第二条命令报错，建议安装 [python.org](https://www.python.org/downloads/macos/) 提供的 macOS Python。该安装包通常已经包含 Tkinter。安装完成后关闭终端并重新打开，再执行上面的检查命令。
+
+启动器本身也会自动检查 Python 版本和 Tkinter。如果环境缺失，它会弹出系统提示框，并将一段安装提示词复制到剪贴板；直接把提示词粘贴给 Codex 即可。
+
+#### 2. 首次启动
+
+在终端进入项目目录后执行：
 
 ```bash
 chmod +x launch-macos.command
 ./launch-macos.command
 ```
 
-以后可以直接双击 `launch-macos.command`。如果执行权限丢失，也可以运行：
+以后可以直接双击 `launch-macos.command`。也可以在任何目录使用完整路径启动，例如：
 
 ```bash
-zsh ./launch-macos.command
+zsh "/Users/用户名/Downloads/codex-armor-control-center/launch-macos.command"
 ```
 
-直接启动界面的命令：
+启动脚本会依次检查以下 Python 入口，兼容 Homebrew、python.org 安装包和系统 `PATH`：
+
+```text
+python3
+/opt/homebrew/bin/python3
+/usr/local/bin/python3
+/Library/Frameworks/Python.framework/Versions/Current/bin/python3
+python
+```
+
+#### 3. 部署并生效
+
+1. 界面打开后点击“一键部署”。
+2. 等待右上角状态变为“已部署”。
+3. 完全退出 Codex，再重新打开 Codex。
+
+默认部署目录是当前用户的 `~/.codex`。需要部署到其他位置时，可展开“高级设置”并选择目标目录。
+
+#### 4. 常见问题
+
+| 现象 | 处理方法 |
+| --- | --- |
+| 提示 `permission denied` | 执行 `chmod +x launch-macos.command` 后重试 |
+| 双击后没有窗口或文件被编辑器打开 | 在终端执行 `zsh ./launch-macos.command` |
+| 提示缺少 Python 3.10+ | 安装新版 Python，重新打开终端后再运行启动器 |
+| 提示缺少 Tkinter 或 `_tkinter` | 安装带 Tkinter 的 python.org 版本，然后重新运行 |
+| macOS 阻止打开下载的文件 | 在“系统设置 → 隐私与安全性”中确认打开，或改用终端运行 |
+| 界面部署成功但 Codex 没变化 | 完全退出 Codex 进程后重新打开 |
+
+如果只想绕过启动器的环境提示，也可以直接运行：
 
 ```bash
 python3 codex56-control-center.py
 ```
-
-macOS 启动器会依次查找常见 Python 安装位置并检查 Tkinter；缺少环境时会通过系统弹窗提示，同时把安装提示词复制到剪贴板。
 
 ## 状态说明
 
