@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.tmp
+*.bak
+*.auto_sync.bak
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Local Codex configuration and deployment state
+.codex/
+config.toml
+.codex-keysmith-manifest.json
+*.journal.json
+*.cleanup.json
+.keysmith-*/
