@@ -748,10 +748,9 @@ def repair_config_conflict(
     target = resolve_codex_dir(codex_dir)
     config_path = target / "config.toml"
     manifest_path = target / MANIFEST_FILENAME
-    if not target.is_dir() or not _is_regular_file(config_path) or not _is_regular_file(
-        manifest_path
-    ):
-        print("[修复失败] Codex 目录、config.toml 或部署清单不存在。")
+
+    if not target.is_dir():
+        print(f"[修复失败] Codex 目录不存在: {target}")
         return 1
 
     managed = inspect_managed_status(str(target))
@@ -759,8 +758,40 @@ def repair_config_conflict(
         print("[修复失败] 发现事务残留，请先执行事务恢复。")
         print(managed.summary_text(), end="")
         return 1
+
+    if managed.status == "deployed":
+        print("[无需修复] 托管内容已经处于正常部署状态。")
+        print("[说明] 状态可能在点击按钮后由自动同步更新，本次按成功处理。")
+        print(managed.summary_text(), end="")
+        return 0
+
+    deploy_args = ["--codex-dir", str(target), "--yes", "--lang", language]
+    if md_file:
+        deploy_args.extend(("--file", md_file))
+    if md_name:
+        deploy_args.extend(("--name", md_name))
+    if skip_hooks:
+        deploy_args.append("--skip-hooks-isolation")
+
+    if managed.status == "not_deployed":
+        if not _is_regular_file(config_path):
+            print("[修复失败] 当前未部署，但缺少可安全读取的 config.toml。")
+            print(managed.summary_text(), end="")
+            return 1
+        print("[状态变化] 当前已是未部署状态，自动转为普通部署。")
+        print(managed.summary_text(), end="")
+        result = _run_core_command(deploy_args)
+        if result.returncode == 0:
+            print("[完成] 已使用 v0.1.2 部署核心完成部署。")
+        return result.returncode
+
     if managed.status != "conflict":
-        print("[修复失败] 当前不是本工具托管内容冲突，请使用高级操作查看详情。")
+        print("[修复失败] 当前状态无法自动修复，请使用高级操作查看详情。")
+        print(managed.summary_text(), end="")
+        return 1
+
+    if not _is_regular_file(config_path) or not _is_regular_file(manifest_path):
+        print("[修复失败] config.toml 或部署清单不是可安全处理的普通文件。")
         print(managed.summary_text(), end="")
         return 1
 
@@ -773,14 +804,6 @@ def repair_config_conflict(
     manifest_path.replace(manifest_backup)
     print(f"[备份] 当前配置: {config_backup}")
     print(f"[备份] 旧部署清单: {manifest_backup}")
-
-    deploy_args = ["--codex-dir", str(target), "--yes", "--lang", language]
-    if md_file:
-        deploy_args.extend(("--file", md_file))
-    if md_name:
-        deploy_args.extend(("--name", md_name))
-    if skip_hooks:
-        deploy_args.append("--skip-hooks-isolation")
 
     result = _run_core_command(deploy_args)
     if result.returncode == 0:
