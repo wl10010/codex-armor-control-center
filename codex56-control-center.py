@@ -611,7 +611,7 @@ def sync_unowned_config_fingerprint(
     )
     blockers = _config_drift_blockers(preview.stdout or "")
     if preview.returncode == 0:
-        return ManifestSyncResult(False, "官方核心未发现需要同步的配置漂移")
+        return ManifestSyncResult(False, "部署核心未发现需要同步的配置漂移")
     if len(blockers) != 1 or not is_whole_config_drift(blockers[0]):
         return ManifestSyncResult(False, "除 config.toml 漂移外还存在其他阻塞项")
 
@@ -673,13 +673,13 @@ def _rollback_manifest_sync(result: ManifestSyncResult) -> str:
         if current_content != result.published_content:
             return "同步后清单再次变化，已保留现场而未自动回滚"
         _atomic_replace_bytes(result.manifest_path, result.original_content)
-        return "官方复检未通过，已回滚部署清单"
+        return "部署核心复检未通过，已回滚部署清单"
     except OSError as exc:
-        return f"官方复检未通过，清单回滚失败: {exc}"
+        return f"部署核心复检未通过，清单回滚失败: {exc}"
 
 
 def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
-    """Use the official status, reconciling only a provably unowned config drift."""
+    """Use the core status, reconciling only a provably unowned config drift."""
     managed = inspect_managed_status(codex_dir)
     core_result = _capture_core_status(codex_dir)
     core_output = core_result.stdout or ""
@@ -712,7 +712,7 @@ def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
 
     managed.status = status
     if status == "conflict" and not managed.issues:
-        managed.issues.append("官方核心检测到部署清单或所有权冲突")
+        managed.issues.append("部署核心检测到部署清单或所有权冲突")
     managed.details.extend(note for note in notes if note)
     combined_output = core_output
     if notes:
@@ -784,7 +784,7 @@ def repair_config_conflict(
 
     result = _run_core_command(deploy_args)
     if result.returncode == 0:
-        print("[完成] 配置冲突已修复，并已由官方 v0.1.1 重新部署。")
+        print("[完成] 配置冲突已修复，并已由 v0.1.2 部署核心重新部署。")
         return 0
 
     if not manifest_path.exists() and manifest_backup.exists():
@@ -816,7 +816,7 @@ def run_conflict_repair_cli(argv: List[str]) -> int:
 
 
 def classify_deployment_status(output: str, exit_code: int) -> str:
-    """Map the stable English fields from the official status command to the GUI."""
+    """Map the stable English fields from the core status command to the GUI."""
     residue_prefix = "Transaction residue:"
     residue_lines = [
         line.strip() for line in output.splitlines() if line.strip().startswith(residue_prefix)
@@ -1366,7 +1366,7 @@ class KeysmithGUI:
     def _validate(self) -> bool:
         operation = self._operation_code()
         if not CORE_SCRIPT.is_file():
-            messagebox.showerror("缺少官方核心文件", f"未找到：\n{CORE_SCRIPT}")
+            messagebox.showerror("缺少部署核心文件", f"未找到：\n{CORE_SCRIPT}")
             return False
 
         codex_dir = self.codex_dir.get().strip()
@@ -1590,7 +1590,7 @@ class KeysmithGUI:
             return
         confirmed = messagebox.askyesno(
             "修复配置冲突",
-            "将备份当前配置和旧部署清单，然后使用官方 v0.1.1 重新部署。\n\n"
+            "将备份当前配置和旧部署清单，然后使用 v0.1.2 部署核心重新部署。\n\n"
             "现有模型、MCP 和插件配置会保留。是否继续？",
         )
         if confirmed:

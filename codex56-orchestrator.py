@@ -162,7 +162,7 @@ BEGIN.
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 BARE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 VERSION = __version__
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = ".codex-keysmith-manifest.json"
@@ -1970,7 +1970,13 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
             self._raise_last_error("cannot create private directory", path)
         identity = _directory_identity(path)
         try:
-            self.verify_private_security(path, is_directory=True)
+            try:
+                self.verify_private_security(path, is_directory=True)
+            except HooksConflict:
+                # Some elevated/built-in Administrator profiles rewrite the
+                # initial directory ACL despite explicit SECURITY_ATTRIBUTES.
+                # Reapply it through an identity-checked handle before failing.
+                self._normalize_private_directory_security(path, identity)
             self.flush_directory(path.parent)
         except BaseException as primary:
             def remove_created_directory() -> None:
@@ -2062,6 +2068,78 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
         ):
             self._raise_last_error("cannot apply private ACL")
 
+    def _apply_protected_private_security(self, handle: int, path: Path) -> None:
+        dacl_present = wintypes.BOOL()
+        dacl_defaulted = wintypes.BOOL()
+        dacl = wintypes.LPVOID()
+        if not self.advapi32.GetSecurityDescriptorDacl(
+            wintypes.LPVOID(self._security_descriptor),
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            self._raise_last_error("cannot read private DACL", path)
+        if not dacl_present.value or not dacl.value:
+            raise HooksConflict(f"private ACL has no DACL: {path}")
+
+        owner_defaulted = wintypes.BOOL()
+        owner = wintypes.LPVOID()
+        if not self.advapi32.GetSecurityDescriptorOwner(
+            wintypes.LPVOID(self._security_descriptor),
+            ctypes.byref(owner),
+            ctypes.byref(owner_defaulted),
+        ):
+            self._raise_last_error("cannot read private ACL owner", path)
+        if not owner.value:
+            raise HooksConflict(f"private ACL has no owner: {path}")
+
+        security_error = self.advapi32.SetSecurityInfo(
+            handle,
+            self._SE_FILE_OBJECT,
+            self._OWNER_SECURITY_INFORMATION
+            | self._DACL_SECURITY_INFORMATION
+            | self._PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            None,
+            dacl,
+            None,
+        )
+        if security_error:
+            raise OSError(
+                security_error,
+                f"cannot apply protected private ACL: {path}: "
+                f"{ctypes.FormatError(security_error).strip()}",
+            )
+
+    def _normalize_private_directory_security(
+        self,
+        path: Path,
+        expected_identity: FileIdentity,
+    ) -> None:
+        handle = self._open_handle(
+            path,
+            self._READ_CONTROL
+            | self._WRITE_DAC
+            | self._WRITE_OWNER
+            | self._FILE_LIST_DIRECTORY
+            | self._FILE_READ_ATTRIBUTES,
+            share_mode=self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+        )
+        try:
+            self._validate_handle_type(handle, path, is_directory=True)
+            self._validate_ntfs(handle, path)
+            if not self._handle_matches_portable_identity(
+                self._handle_identity(handle),
+                expected_identity,
+            ):
+                raise HooksConflict(
+                    f"private ACL directory identity changed before repair: {path}"
+                )
+            self._apply_protected_private_security(handle, path)
+            self._verify_handle_private_security(handle, path)
+        finally:
+            self.kernel32.CloseHandle(handle)
+
     def apply_private_path_security(
         self,
         path: Path,
@@ -2097,45 +2175,7 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
             actual = _fingerprint_descriptor(descriptor, opened, path)
             self._validate_expected_fingerprint(path, actual, expected)
             raw_handle = self.msvcrt.get_osfhandle(descriptor)
-            dacl_present = wintypes.BOOL()
-            dacl_defaulted = wintypes.BOOL()
-            dacl = wintypes.LPVOID()
-            if not self.advapi32.GetSecurityDescriptorDacl(
-                wintypes.LPVOID(self._security_descriptor),
-                ctypes.byref(dacl_present),
-                ctypes.byref(dacl),
-                ctypes.byref(dacl_defaulted),
-            ):
-                self._raise_last_error("cannot read private DACL", path)
-            if not dacl_present.value or not dacl.value:
-                raise HooksConflict(f"private ACL has no DACL: {path}")
-            owner_defaulted = wintypes.BOOL()
-            owner = wintypes.LPVOID()
-            if not self.advapi32.GetSecurityDescriptorOwner(
-                wintypes.LPVOID(self._security_descriptor),
-                ctypes.byref(owner),
-                ctypes.byref(owner_defaulted),
-            ):
-                self._raise_last_error("cannot read private ACL owner", path)
-            if not owner.value:
-                raise HooksConflict(f"private ACL has no owner: {path}")
-            security_error = self.advapi32.SetSecurityInfo(
-                raw_handle,
-                self._SE_FILE_OBJECT,
-                self._OWNER_SECURITY_INFORMATION
-                | self._DACL_SECURITY_INFORMATION
-                | self._PROTECTED_DACL_SECURITY_INFORMATION,
-                owner,
-                None,
-                dacl,
-                None,
-            )
-            if security_error:
-                raise OSError(
-                    security_error,
-                    f"cannot apply protected private ACL: {path}: "
-                    f"{ctypes.FormatError(security_error).strip()}",
-                )
+            self._apply_protected_private_security(raw_handle, path)
             self._verify_handle_private_security(raw_handle, path)
             if not self.kernel32.FlushFileBuffers(raw_handle):
                 self._raise_last_error("cannot persist private ACL", path)
@@ -2289,7 +2329,15 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
             mask != self._FILE_ALL_ACCESS or flags != 0
             for mask, flags in principals.values()
         ):
-            raise HooksConflict(f"private ACL grants unexpected access: {path}")
+            principal_text = ", ".join(
+                f"{sid}=0x{mask:08x}/flags=0x{flags:02x}"
+                for sid, (mask, flags) in sorted(principals.items())
+            )
+            raise HooksConflict(
+                f"private ACL grants unexpected access: {path}; "
+                f"protected={protected}, owner={owner_sid}, "
+                f"expected_owner={self._current_sid}, principals=[{principal_text}]"
+            )
 
     def _verify_handle_recovery_security(self, handle: int, path: Path) -> None:
         _protected, owner_sid, principals = self._handle_acl(handle, path)
