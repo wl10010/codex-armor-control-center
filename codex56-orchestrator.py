@@ -162,7 +162,7 @@ BEGIN.
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 BARE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 VERSION = __version__
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = ".codex-keysmith-manifest.json"
@@ -603,9 +603,31 @@ def atomic_write_text(
     expected_fingerprint: Optional["FileFingerprint"] = None,
     require_absent: bool = False,
     on_published: Optional[Callable[["FileFingerprint"], None]] = None,
+    clone_security_from: Optional[os.stat_result] = None,
+    clone_security_descriptor: Optional[int] = None,
+    clone_security_snapshot: Optional[object] = None,
 ) -> None:
     """Write text atomically within the target directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    security_snapshot = clone_security_snapshot
+    if clone_security_from is not None:
+        if security_snapshot is not None:
+            raise ValueError("security snapshot and source cannot both be supplied")
+        security_snapshot = _FILESYSTEM.capture_file_security(
+            clone_security_from,
+            clone_security_descriptor,
+        )
+
+    def finalize_published(fingerprint: "FileFingerprint") -> None:
+        if security_snapshot is not None:
+            _FILESYSTEM.apply_path_security_snapshot(
+                path,
+                fingerprint,
+                security_snapshot,
+            )
+        if on_published:
+            on_published(fingerprint)
+
     transaction_dir = None
     tmp_path = None
     try:
@@ -627,8 +649,7 @@ def atomic_write_text(
                     raise HooksConflict(f"目标文件被并发创建: {path}")
                 if not _path_has_fingerprint(path, prepared_fingerprint):
                     raise HooksConflict(f"发布后的目标文件节点不匹配: {path}")
-                if on_published:
-                    on_published(prepared_fingerprint)
+                finalize_published(prepared_fingerprint)
             except BaseException:
                 if _path_has_fingerprint(path, prepared_fingerprint):
                     try:
@@ -641,12 +662,11 @@ def atomic_write_text(
                 path,
                 tmp_path,
                 expected_fingerprint,
-                on_published=on_published,
+                on_published=finalize_published,
             )
         else:
             _FILESYSTEM.replace_atomic(tmp_path, path)
-            if on_published:
-                on_published(_fingerprint_regular_file(path))
+            finalize_published(_fingerprint_regular_file(path))
         tmp_path = None
         _remove_transaction_dir(transaction_dir)
         transaction_dir = None
@@ -899,10 +919,8 @@ def backup_file(
                     shutil.copyfileobj(source, destination)
                     destination.flush()
                     os.fsync(destination.fileno())
-                    _FILESYSTEM.clone_file_security(
-                        destination.fileno(),
-                        source_stat,
-                    )
+                    # Backups can contain credentials from config.toml. Keep the
+                    # private mode/ACL created by _open_exclusive_private_file.
                 source_after = _fingerprint_descriptor(
                     source_descriptor,
                     source_stat,
@@ -1027,10 +1045,52 @@ class _PosixFilesystemBackend:
         path: Path,
         expected: FileFingerprint,
     ) -> None:
-        del path, expected
+        descriptor, opened = _open_regular_descriptor(path, path.name)
+        try:
+            before = _fingerprint_descriptor(descriptor, opened, path)
+            if before != expected:
+                raise HooksConflict(f"私有权限目标在更新前发生变化: {path}")
+            os.fchmod(descriptor, 0o600)
+            after = _fingerprint_descriptor(descriptor, os.fstat(descriptor), path)
+            if after != expected:
+                raise HooksConflict(f"私有权限目标在更新期间发生变化: {path}")
+        finally:
+            os.close(descriptor)
 
-    def clone_file_security(self, descriptor: int, source_stat: os.stat_result) -> None:
+    def clone_file_security(
+        self,
+        descriptor: int,
+        source_stat: os.stat_result,
+        source_descriptor: Optional[int] = None,
+    ) -> None:
+        del source_descriptor
         os.fchmod(descriptor, stat.S_IMODE(source_stat.st_mode))
+
+    def capture_file_security(
+        self,
+        source_stat: os.stat_result,
+        source_descriptor: Optional[int] = None,
+    ) -> object:
+        del source_descriptor
+        return stat.S_IMODE(source_stat.st_mode)
+
+    def apply_path_security_snapshot(
+        self,
+        path: Path,
+        expected: FileFingerprint,
+        snapshot: object,
+    ) -> None:
+        descriptor, opened = _open_regular_descriptor(path, path.name)
+        try:
+            before = _fingerprint_descriptor(descriptor, opened, path)
+            if before != expected:
+                raise HooksConflict(f"安全属性目标在发布后发生变化: {path}")
+            os.fchmod(descriptor, int(snapshot))
+            after = _fingerprint_descriptor(descriptor, os.fstat(descriptor), path)
+            if after != expected:
+                raise HooksConflict(f"安全属性目标在更新期间发生变化: {path}")
+        finally:
+            os.close(descriptor)
 
     def verify_private_security(self, path: Path, is_directory: bool) -> None:
         mode = stat.S_IMODE(os.lstat(path).st_mode)
@@ -1412,12 +1472,14 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
     _FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x00000010
     _OWNER_SECURITY_INFORMATION = 0x00000001
     _DACL_SECURITY_INFORMATION = 0x00000004
+    _UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
     _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
     _SE_FILE_OBJECT = 1
     _ACCESS_ALLOWED_ACE_TYPE = 0
     _FILE_ALL_ACCESS = 0x001F01FF
     _OWNER_RIGHTS_SID = "S-1-3-4"
     _SE_DACL_PROTECTED = 0x1000
+    _INHERITED_ACE = 0x10
     _TOKEN_QUERY = 0x0008
     _TOKEN_USER = 1
     _SDDL_REVISION_1 = 1
@@ -2190,9 +2252,189 @@ class _WindowsFilesystemBackend(_PosixFilesystemBackend):  # pragma: no cover
             elif handle:
                 self.kernel32.CloseHandle(handle)
 
-    def clone_file_security(self, descriptor: int, source_stat: os.stat_result) -> None:
+    def clone_file_security(
+        self,
+        descriptor: int,
+        source_stat: os.stat_result,
+        source_descriptor: Optional[int] = None,
+    ) -> None:
+        if source_descriptor is None:
+            self.apply_private_file_security(descriptor)
+            return
+
+        snapshot = self.capture_file_security(source_stat, source_descriptor)
+        self._apply_file_security_snapshot(descriptor, snapshot)
+
+    def capture_file_security(
+        self,
+        source_stat: os.stat_result,
+        source_descriptor: Optional[int] = None,
+    ) -> object:
         del source_stat
-        self.apply_private_file_security(descriptor)
+        if source_descriptor is None:
+            raise HooksConflict("Windows ACL 快照缺少源文件句柄")
+
+        source_handle = self.msvcrt.get_osfhandle(source_descriptor)
+        security_information = self._DACL_SECURITY_INFORMATION
+        needed = wintypes.DWORD()
+        self.advapi32.GetKernelObjectSecurity(
+            source_handle,
+            security_information,
+            None,
+            0,
+            ctypes.byref(needed),
+        )
+        if not needed.value:
+            self._raise_last_error("cannot size source ACL")
+        source_security = ctypes.create_string_buffer(needed.value)
+        if not self.advapi32.GetKernelObjectSecurity(
+            source_handle,
+            security_information,
+            source_security,
+            len(source_security),
+            ctypes.byref(needed),
+        ):
+            self._raise_last_error("cannot read source ACL")
+
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not self.advapi32.GetSecurityDescriptorControl(
+            source_security,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            self._raise_last_error("cannot inspect source ACL control")
+
+        protected = bool(control.value & self._SE_DACL_PROTECTED)
+        explicit_acl = None
+        if not protected:
+            dacl_present = wintypes.BOOL()
+            dacl_defaulted = wintypes.BOOL()
+            dacl = wintypes.LPVOID()
+            if not self.advapi32.GetSecurityDescriptorDacl(
+                source_security,
+                ctypes.byref(dacl_present),
+                ctypes.byref(dacl),
+                ctypes.byref(dacl_defaulted),
+            ):
+                self._raise_last_error("cannot inspect source DACL")
+            if not dacl_present.value:
+                raise HooksConflict("source ACL has no DACL")
+            if dacl.value:
+                header = ctypes.cast(dacl, ctypes.POINTER(self._ACL_HEADER)).contents
+                ace_bytes = []
+                for index in range(header.AceCount):
+                    ace = wintypes.LPVOID()
+                    if not self.advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                        self._raise_last_error("cannot inspect source ACE")
+                    ace_header = ctypes.cast(
+                        ace,
+                        ctypes.POINTER(self._ACE_HEADER),
+                    ).contents
+                    if not ace_header.AceFlags & self._INHERITED_ACE:
+                        ace_bytes.append(ctypes.string_at(ace, ace_header.AceSize))
+                acl_size = ctypes.sizeof(self._ACL_HEADER) + sum(map(len, ace_bytes))
+                explicit_header = self._ACL_HEADER(
+                    header.AclRevision,
+                    0,
+                    acl_size,
+                    len(ace_bytes),
+                    0,
+                )
+                explicit_acl = bytes(explicit_header) + b"".join(ace_bytes)
+
+        return (
+            bytes(source_security.raw[: needed.value]),
+            protected,
+            explicit_acl,
+        )
+
+    def _apply_file_security_snapshot(
+        self,
+        descriptor: int,
+        snapshot: object,
+    ) -> None:
+        security_bytes, protected, explicit_acl = snapshot
+        source_security = ctypes.create_string_buffer(security_bytes)
+
+        dacl_present = wintypes.BOOL()
+        dacl_defaulted = wintypes.BOOL()
+        dacl = wintypes.LPVOID()
+        if not self.advapi32.GetSecurityDescriptorDacl(
+            source_security,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            self._raise_last_error("cannot inspect source DACL")
+        if not dacl_present.value:
+            raise HooksConflict("source ACL has no DACL")
+
+        explicit_buffer = None
+        if not protected and explicit_acl is not None:
+            explicit_buffer = ctypes.create_string_buffer(explicit_acl)
+            dacl = ctypes.cast(explicit_buffer, wintypes.LPVOID)
+        destination_handle = self.msvcrt.get_osfhandle(descriptor)
+
+        def apply_dacl(protection_flag: int) -> None:
+            security_error = self.advapi32.SetSecurityInfo(
+                destination_handle,
+                self._SE_FILE_OBJECT,
+                self._DACL_SECURITY_INFORMATION | protection_flag,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            if security_error:
+                raise OSError(
+                    security_error,
+                    "cannot clone source ACL: "
+                    + ctypes.FormatError(security_error).strip(),
+                )
+
+        if protected:
+            apply_dacl(self._PROTECTED_DACL_SECURITY_INFORMATION)
+        else:
+            apply_dacl(self._PROTECTED_DACL_SECURITY_INFORMATION)
+            apply_dacl(self._UNPROTECTED_DACL_SECURITY_INFORMATION)
+
+    def apply_path_security_snapshot(
+        self,
+        path: Path,
+        expected: FileFingerprint,
+        snapshot: object,
+    ) -> None:
+        handle = self._open_handle(
+            path,
+            self._GENERIC_READ
+            | self._READ_CONTROL
+            | self._WRITE_DAC
+            | self._FILE_READ_ATTRIBUTES,
+            share_mode=self._FILE_SHARE_READ,
+        )
+        descriptor = None
+        try:
+            self._validate_handle_type(handle, path, is_directory=False)
+            self._validate_ntfs(handle, path)
+            descriptor = self.msvcrt.open_osfhandle(
+                handle,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            handle = 0
+            opened = os.fstat(descriptor)
+            before = _fingerprint_descriptor(descriptor, opened, path)
+            if before != expected:
+                raise HooksConflict(f"安全属性目标在发布后发生变化: {path}")
+            self._apply_file_security_snapshot(descriptor, snapshot)
+            after = _fingerprint_descriptor(descriptor, os.fstat(descriptor), path)
+            if after != expected:
+                raise HooksConflict(f"安全属性目标在更新期间发生变化: {path}")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            elif handle:
+                self.kernel32.CloseHandle(handle)
 
     def _handle_acl(
         self,
@@ -4259,7 +4501,7 @@ def _secure_verified_transaction_claim(
     path: Path,
     fingerprint: FileFingerprint,
 ) -> None:
-    # Windows claims intentionally retain a private ACL when restored or published.
+    # Claims must be private before they leave the owned transaction directory.
     if str(path.parent) not in _OWNED_DIRECTORY_RECORDS:
         raise HooksConflict(f"verified claim is outside an owned transaction: {path}")
     _FILESYSTEM.apply_private_path_security(path, fingerprint)
@@ -4402,10 +4644,6 @@ def _copy_to_unique_backup(
                 shutil.copyfileobj(source_file, destination)
                 destination.flush()
                 os.fsync(destination.fileno())
-                _FILESYSTEM.clone_file_security(
-                    destination.fileno(),
-                    source_stat,
-                )
             source_after = _fingerprint_descriptor(
                 source_descriptor,
                 source_stat,
@@ -4501,7 +4739,10 @@ def _copy_file_no_replace(
             shutil.copyfileobj(source_file, temporary)
             temporary.flush()
             os.fsync(temporary.fileno())
-            _FILESYSTEM.clone_file_security(temporary.fileno(), source_stat)
+            _FILESYSTEM.clone_file_security(
+                temporary.fileno(),
+                source_stat,
+            )
         _FILESYSTEM.set_file_times(
             temporary_path,
             source_stat.st_atime_ns,
@@ -4559,6 +4800,7 @@ def _transactional_replace_existing(
     )
     previous_claim = transaction_dir / "previous"
 
+    original_security_snapshot = None
     try:
         if not _atomic_rename_no_replace(destination, previous_claim):
             raise HooksConflict(f"无法原子认领目标文件: {destination}")
@@ -4566,6 +4808,17 @@ def _transactional_replace_existing(
         if claimed_fingerprint != expected_fingerprint:
             _rollback_claim(previous_claim, destination, timestamp)
             raise HooksConflict(f"目标文件在写入前发生变化: {destination}")
+        security_descriptor, security_stat = _open_regular_descriptor(
+            previous_claim,
+            previous_claim.name,
+        )
+        try:
+            original_security_snapshot = _FILESYSTEM.capture_file_security(
+                security_stat,
+                security_descriptor,
+            )
+        finally:
+            os.close(security_descriptor)
         _secure_verified_transaction_claim(previous_claim, claimed_fingerprint)
 
         if not _atomic_rename_no_replace(prepared_file, destination):
@@ -4623,6 +4876,15 @@ def _transactional_replace_existing(
                             destination,
                             timestamp,
                         )
+            if (
+                original_security_snapshot is not None
+                and _path_has_fingerprint(destination, expected_fingerprint)
+            ):
+                _FILESYSTEM.apply_path_security_snapshot(
+                    destination,
+                    expected_fingerprint,
+                    original_security_snapshot,
+                )
         except BaseException as cleanup_exc:
             _print(
                 f"[事务警告] 写入回滚未完整完成: {cleanup_exc}",
@@ -5766,7 +6028,10 @@ def _copy_snapshot(source: Path, destination: Path) -> None:
                 shutil.copyfileobj(source_file, target)
                 target.flush()
                 os.fsync(target.fileno())
-                _FILESYSTEM.clone_file_security(target.fileno(), source_stat)
+                _FILESYSTEM.clone_file_security(
+                    target.fileno(),
+                    source_stat,
+                )
             _FILESYSTEM.set_file_times(
                 destination,
                 source_stat.st_atime_ns,
@@ -8833,9 +9098,27 @@ def _replace_owned_from_backup(
     expected_backup: Optional[FileFingerprint] = None,
 ) -> FileFingerprint:
     source_descriptor, source_stat = _open_regular_descriptor(backup, backup.name)
+    destination_descriptor = None
     transaction_dir = None
     temporary_path = None
     try:
+        destination_descriptor, destination_stat = _open_regular_descriptor(
+            destination,
+            destination.name,
+        )
+        destination_fingerprint = _fingerprint_descriptor(
+            destination_descriptor,
+            destination_stat,
+            destination,
+        )
+        if destination_fingerprint != expected_current:
+            raise HooksConflict(f"卸载目标在安全属性复制前发生变化: {destination}")
+        destination_security = _FILESYSTEM.capture_file_security(
+            destination_stat,
+            destination_descriptor,
+        )
+        os.close(destination_descriptor)
+        destination_descriptor = None
         transaction_dir, _identity = _make_registered_transaction_dir(
             destination.parent,
             "uninstall-restore",
@@ -8849,7 +9132,6 @@ def _replace_owned_from_backup(
             shutil.copyfileobj(source, temporary)
             temporary.flush()
             os.fsync(temporary.fileno())
-            _FILESYSTEM.clone_file_security(temporary.fileno(), source_stat)
         source_after = _fingerprint_descriptor(
             source_descriptor,
             source_stat,
@@ -8866,6 +9148,11 @@ def _replace_owned_from_backup(
             destination,
             temporary_path,
             expected_current,
+            on_published=lambda fingerprint: _FILESYSTEM.apply_path_security_snapshot(
+                destination,
+                fingerprint,
+                destination_security,
+            ),
         )
         temporary_path = None
         _remove_transaction_dir(transaction_dir)
@@ -8873,6 +9160,8 @@ def _replace_owned_from_backup(
         return _fingerprint_regular_file(destination)
     finally:
         os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
@@ -9879,12 +10168,315 @@ def ensure_model_instructions(config_path: Path, md_filename: str) -> bool:
     updated_content, changed = render_model_instructions(content, md_filename)
     if not changed:
         return False
+    source_descriptor, source_stat = _open_regular_descriptor(
+        config_path,
+        "config.toml",
+    )
+    try:
+        source_fingerprint = _fingerprint_descriptor(
+            source_descriptor,
+            source_stat,
+            config_path,
+        )
+        if source_fingerprint != expected_fingerprint:
+            raise HooksConflict("config.toml 在安全属性复制前发生变化")
+        security_snapshot = _FILESYSTEM.capture_file_security(
+            source_stat,
+            source_descriptor,
+        )
+    finally:
+        os.close(source_descriptor)
     atomic_write_text(
         config_path,
         updated_content,
         expected_fingerprint=expected_fingerprint,
+        clone_security_snapshot=security_snapshot,
     )
     return True
+
+
+def _managed_instruction_reference_matches(
+    reference: Optional[str],
+    md_filename: str,
+) -> bool:
+    if reference is None:
+        return False
+    normalized = reference.replace("\\", "/") if os.name == "nt" else reference
+    return normalized in {md_filename, f"./{md_filename}"}
+
+
+def _without_statement_ending(content: str, statement: TomlRootStatement) -> str:
+    value = content[statement.start : statement.end]
+    ending = _statement_newline(content, statement)
+    return value[: -len(ending)] if ending else value
+
+
+def _render_config_rollback(
+    current_content: str,
+    original_content: str,
+    md_filename: str,
+) -> str:
+    """Keep external config changes while restoring the pre-deploy instruction value."""
+    current = _analyze_toml_root(current_content)
+    original = _analyze_toml_root(original_content)
+    if not _managed_instruction_reference_matches(
+        current.instruction_reference,
+        md_filename,
+    ):
+        raise ConfigConflict(
+            "当前 model_instructions_file 未指向托管提示词，拒绝接纳配置漂移"
+        )
+    statement = current.instruction_statement
+    if statement is None:
+        raise ConfigConflict("当前 config.toml 缺少托管的 model_instructions_file")
+
+    if original.instruction_statement is None:
+        replacement = ""
+    else:
+        replacement = _without_statement_ending(
+            original_content,
+            original.instruction_statement,
+        ) + _statement_newline(current_content, statement)
+    updated = current_content[: statement.start] + replacement + current_content[statement.end :]
+    verified = _analyze_toml_root(updated)
+    if verified.instruction_reference != original.instruction_reference:
+        raise ConfigConflict("无法精确重建 config.toml 的部署前指令值")
+    return updated
+
+
+def _reconcile_backup_candidate(path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    attempt = 0
+    while True:
+        suffix = "" if attempt == 0 else f"_{attempt}"
+        candidate = path.with_name(f"{path.name}.bak_{timestamp}{suffix}")
+        if not _path_entry_exists(candidate):
+            return candidate
+        attempt += 1
+
+
+def _portable_content_matches(
+    actual: FileFingerprint,
+    expected: Dict[str, Any],
+) -> bool:
+    return actual.size == expected["size"] and actual.sha256 == expected["sha256"]
+
+
+def _manifest_backup_names(manifest: Dict[str, Any]) -> set:
+    names = set()
+    for section, keys in (
+        ("md", ("backup",)),
+        ("config", ("backup",)),
+        ("hooks", ("backup", "previous_disabled_backup")),
+        ("legacy", ("archive",)),
+        ("previous_manifest", ("backup",)),
+    ):
+        value = manifest.get(section)
+        if not isinstance(value, dict):
+            continue
+        for key in keys:
+            name = value.get(key)
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _previous_manifest_references_backup(
+    codex_dir: Path,
+    manifest: Dict[str, Any],
+    backup_name: str,
+) -> bool:
+    previous_name = manifest["previous_manifest"]["backup"]
+    if previous_name is None:
+        return False
+    try:
+        previous_manifest, _fingerprint = _load_manifest(codex_dir / previous_name)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return True
+    return backup_name in _manifest_backup_names(previous_manifest)
+
+
+def _reconcile_managed_directory_locked(codex_dir: Path) -> bool:
+    """Adopt non-managed config changes and recover provably identical backups."""
+    _reject_hooks_transaction_residue(codex_dir)
+    manifest_path = codex_dir / MANIFEST_FILENAME
+    manifest_content, manifest_fingerprint = _read_regular_text_with_fingerprint(
+        manifest_path,
+        "部署清单",
+    )
+    try:
+        manifest = _validate_manifest(json.loads(manifest_content))
+    except json.JSONDecodeError as exc:
+        raise ConfigConflict(f"部署清单不是有效 JSON: {manifest_path}: {exc}") from exc
+
+    md = manifest["md"]
+    md_path = codex_dir / md["path"]
+    md_fingerprint = _fingerprint_regular_file(md_path)
+    if not _portable_matches(md_path, md["after"]):
+        raise ConfigConflict("部署的提示词内容已变化，拒绝自动接纳")
+
+    config = manifest["config"]
+    config_path = codex_dir / config["path"]
+    config_content, config_fingerprint = _read_regular_text_with_fingerprint(
+        config_path,
+        "config.toml",
+    )
+    config_analysis = _analyze_toml_root(config_content)
+    if not _managed_instruction_reference_matches(
+        config_analysis.instruction_reference,
+        md["path"],
+    ):
+        raise ConfigConflict(
+            "model_instructions_file 未指向托管提示词，拒绝自动接纳"
+        )
+
+    changed = False
+    superseded_config_backup: Optional[Tuple[Path, FileFingerprint]] = None
+    created_backups: List[Tuple[Path, FileFingerprint]] = []
+    before_md = md["before"]
+    if before_md is not None:
+        backup_name = md["backup"]
+        backup_path = codex_dir / backup_name
+        if not _portable_matches(backup_path, before_md):
+            if not _portable_content_matches(md_fingerprint, before_md):
+                raise ConfigConflict("提示词原始回滚备份缺失且内容无法重建")
+            rebuilt_backup = backup_file(md_path)
+            rebuilt_fingerprint = _fingerprint_regular_file(rebuilt_backup)
+            created_backups.append((rebuilt_backup, rebuilt_fingerprint))
+            md["before"] = _portable_fingerprint(rebuilt_fingerprint)
+            md["backup"] = rebuilt_backup.name
+            changed = True
+            _print(f"[修复] 已重建内容一致的提示词回滚备份: {rebuilt_backup}")
+
+    if not _portable_matches(config_path, config["after"]):
+        if config["changed"]:
+            original_backup = codex_dir / config["backup"]
+            if not _portable_matches(original_backup, config["before"]):
+                raise ConfigConflict("config.toml 原始回滚备份缺失或已变化")
+            original_content, original_backup_fingerprint = _read_regular_text_with_fingerprint(
+                original_backup,
+                "config.toml 回滚备份",
+            )
+            rollback_content = _render_config_rollback(
+                config_content,
+                original_content,
+                md["path"],
+            )
+            reconciled_backup = _reconcile_backup_candidate(config_path)
+            source_descriptor, source_stat = _open_regular_descriptor(
+                original_backup,
+                "config.toml 回滚备份",
+            )
+            try:
+                source_fingerprint = _fingerprint_descriptor(
+                    source_descriptor,
+                    source_stat,
+                    original_backup,
+                )
+                if source_fingerprint != original_backup_fingerprint:
+                    raise HooksConflict("config.toml 回滚备份在安全属性复制前发生变化")
+                atomic_write_text(
+                    reconciled_backup,
+                    rollback_content,
+                    require_absent=True,
+                )
+            finally:
+                os.close(source_descriptor)
+            rollback_fingerprint = _fingerprint_regular_file(reconciled_backup)
+            created_backups.append((reconciled_backup, rollback_fingerprint))
+            config["before"] = _portable_fingerprint(rollback_fingerprint)
+            config["backup"] = reconciled_backup.name
+            superseded_config_backup = (
+                original_backup,
+                original_backup_fingerprint,
+            )
+        else:
+            config["before"] = _portable_fingerprint(config_fingerprint)
+        config["after"] = _portable_fingerprint(config_fingerprint)
+        changed = True
+        _print("[同步] 已接纳 config.toml 中的非托管字段变化")
+
+    if not changed:
+        verification = inspect_uninstall_directory(codex_dir)
+        if verification.blockers:
+            raise ConfigConflict(
+                "回滚或所有权证据不完整: " + "; ".join(verification.blockers)
+            )
+        _print("[无需同步] 托管内容和回滚证据均正常")
+        return False
+
+    manifest_backup = backup_file(
+        manifest_path,
+        expected_fingerprint=manifest_fingerprint,
+    )
+    manifest_backup_fingerprint = _fingerprint_regular_file(manifest_backup)
+    created_backups.append((manifest_backup, manifest_backup_fingerprint))
+    published_content = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    published_fingerprint = None
+
+    def remember_published(fingerprint: FileFingerprint) -> None:
+        nonlocal published_fingerprint
+        published_fingerprint = fingerprint
+
+    atomic_write_text(
+        manifest_path,
+        published_content,
+        expected_fingerprint=manifest_fingerprint,
+        on_published=remember_published,
+    )
+    if published_fingerprint is None:
+        raise HooksConflict("同步后的部署清单缺少发布指纹")
+
+    verification = inspect_uninstall_directory(codex_dir)
+    if verification.blockers:
+        atomic_write_text(
+            manifest_path,
+            manifest_content,
+            expected_fingerprint=published_fingerprint,
+        )
+        cleanup_errors = []
+        for created_path, created_fingerprint in reversed(created_backups):
+            try:
+                _rollback_owned_file(created_path, created_fingerprint, None)
+            except OSError as exc:
+                cleanup_errors.append(f"{created_path}: {exc}")
+        cleanup_note = (
+            "；本次新建备份清理失败: " + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        raise ConfigConflict(
+            "同步后卸载证据仍不完整，已回滚部署清单: "
+            + "; ".join(verification.blockers)
+            + cleanup_note
+        )
+    cleanup_targets = [(manifest_backup, manifest_backup_fingerprint)]
+    if (
+        superseded_config_backup is not None
+        and not _previous_manifest_references_backup(
+            codex_dir,
+            manifest,
+            superseded_config_backup[0].name,
+        )
+    ):
+        cleanup_targets.append(superseded_config_backup)
+    for obsolete_path, obsolete_fingerprint in cleanup_targets:
+        try:
+            _rollback_owned_file(obsolete_path, obsolete_fingerprint, None)
+        except OSError as exc:
+            _print(f"[清理警告] 旧同步备份保留未删: {obsolete_path}: {exc}")
+    _print("[完成] 托管状态已同步，过期同步备份已清理")
+    return True
+
+
+def reconcile_managed_state(codex_dirs: List[str]) -> None:
+    if not codex_dirs:
+        raise ConfigConflict("未找到需要同步的 Codex 配置目录")
+    with _DirectoryLockSet(codex_dirs) as locks:
+        for directory in locks.directories:
+            _reconcile_managed_directory_locked(directory.path)
 
 
 def load_md_content(file_path: Optional[str]) -> str:
@@ -10408,6 +11000,26 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
                 state.config_expected_sha256 = hashlib.sha256(
                     updated_config.encode("utf-8")
                 ).hexdigest()
+                security_descriptor, security_stat = _open_regular_descriptor(
+                    config_path,
+                    "config.toml",
+                )
+                try:
+                    security_fingerprint = _fingerprint_descriptor(
+                        security_descriptor,
+                        security_stat,
+                        config_path,
+                    )
+                    if security_fingerprint != config_expected_fingerprint:
+                        raise HooksConflict(
+                            f"config.toml 在安全属性复制前发生变化: {config_path}"
+                        )
+                    security_snapshot = _FILESYSTEM.capture_file_security(
+                        security_stat,
+                        security_descriptor,
+                    )
+                finally:
+                    os.close(security_descriptor)
                 atomic_write_text(
                     config_path,
                     updated_config,
@@ -10417,6 +11029,7 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
                         "config_fingerprint",
                         fingerprint,
                     ),
+                    clone_security_snapshot=security_snapshot,
                 )
                 _print(f"  [备份] config.toml → {state.config_backup.name}")
                 _print(
@@ -10597,6 +11210,47 @@ def recover_deployment(codex_dirs: List[str], yes: bool) -> None:
             locks.__exit__(None, None, None)
     raise HooksConflict("recovery participant set did not stabilize while acquiring locks")
 
+
+def _repair_redeploy_locked(args, codex_dir: Path) -> None:
+    current = inspect_uninstall_directory(codex_dir)
+    if not current.blockers:
+        _print("[无需修复] 当前部署和回滚证据均正常")
+        return
+
+    config_path = codex_dir / "config.toml"
+    manifest_path = codex_dir / MANIFEST_FILENAME
+    config_fingerprint = _fingerprint_regular_file(config_path)
+    manifest_fingerprint = _fingerprint_regular_file(manifest_path)
+    config_backup = backup_file(
+        config_path,
+        expected_fingerprint=config_fingerprint,
+    )
+    manifest_backup = backup_file(
+        manifest_path,
+        expected_fingerprint=manifest_fingerprint,
+    )
+    _print(f"[备份] 当前配置: {config_backup}")
+    _print(f"[备份] 旧部署清单: {manifest_backup}")
+
+    _rollback_owned_file(manifest_path, manifest_fingerprint, None)
+    try:
+        _deploy_locked(args, [str(codex_dir)])
+    except BaseException:
+        if not _path_entry_exists(manifest_path):
+            if _copy_file_no_replace(manifest_backup, manifest_path):
+                _print("[回滚] 重新部署失败，旧部署清单已恢复")
+            else:
+                _print("[回滚警告] 旧部署清单的恢复目标已被占用")
+        raise
+
+
+def repair_redeploy(args, codex_dir: str) -> None:
+    with _DirectoryLockSet([codex_dir]) as locks:
+        if len(locks.directories) != 1:
+            raise HooksConflict("修复操作未取得唯一 Codex 目录锁")
+        _repair_redeploy_locked(args, locks.directories[0].path)
+
+
 def deploy(args) -> None:
     preview_only = args.dry_run or not args.yes
     if preview_only:
@@ -10713,6 +11367,16 @@ Examples:
             "Preview or recover an interrupted durable deploy/uninstall transaction",
         ),
     )
+    operation_group.add_argument(
+        "--reconcile-managed-state",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    operation_group.add_argument(
+        "--repair-redeploy",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -10814,6 +11478,16 @@ Examples:
                 "--recover conflicts with --file, --name, and --skip-hooks-isolation",
             )
         )
+    if args.reconcile_managed_state and (
+        not args.codex_dir
+        or hasattr(args, "file")
+        or hasattr(args, "name")
+        or args.yes
+        or args.skip_hooks_isolation
+    ):
+        parser.error("--reconcile-managed-state 只接受 --codex-dir 和 --lang")
+    if args.repair_redeploy and (not args.codex_dir or not args.yes):
+        parser.error("--repair-redeploy 必须同时指定 --codex-dir 和 --yes")
 
     if not hasattr(args, "file"):
         args.file = None
@@ -10849,6 +11523,22 @@ Examples:
 
     if args.status:
         show_status(find_status_dirs())
+        return
+
+    if args.reconcile_managed_state:
+        try:
+            reconcile_managed_state([str(codex_root)])
+        except (ConfigConflict, HooksConflict, OSError, ValueError, UnicodeDecodeError) as exc:
+            _print(f"[错误] 托管状态同步失败: {exc}")
+            sys.exit(1)
+        return
+
+    if args.repair_redeploy:
+        try:
+            repair_redeploy(args, str(codex_root))
+        except (ConfigConflict, HooksConflict, OSError, ValueError, UnicodeDecodeError) as exc:
+            _print(f"[错误] 配置冲突修复失败: {exc}")
+            sys.exit(1)
         return
 
     if args.uninstall:

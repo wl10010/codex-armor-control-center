@@ -11,12 +11,9 @@ import queue
 import re
 import runpy
 import shlex
-import shutil
-import stat
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import dataclass, field
@@ -37,7 +34,6 @@ CORE_SCRIPT_NAME = "codex56-orchestrator.py"
 CORE_CLI_FLAG = "--keysmith-core-cli"
 REPAIR_CLI_FLAG = "--repair-config-conflict"
 MANIFEST_FILENAME = ".codex-keysmith-manifest.json"
-MANIFEST_AUTO_SYNC_BACKUP = f"{MANIFEST_FILENAME}.auto_sync.bak"
 JOURNAL_PREFIX = ".codex-keysmith-transaction-"
 CLEANUP_MARKER_PREFIX = ".codex-keysmith-cleanup-"
 CLEANUP_MARKER_SUFFIX = ".intent.json"
@@ -61,7 +57,7 @@ STATUS_STYLES = {
     "checking": ("检查中...", "#E8F1FB", "#005A9E"),
     "recovery": ("事务待恢复", "#FFF4CE", "#7A5D00"),
     "conflict": ("已部署（配置冲突）", "#FDE7E9", "#A4262C"),
-    "degraded": ("已部署（回滚备份缺失）", "#FFF4CE", "#7A5D00"),
+    "degraded": ("已部署（维护受阻）", "#FFF4CE", "#7A5D00"),
     "blocked": ("部署受阻", "#FDE7E9", "#A4262C"),
     "deployed": ("已部署", "#DFF6DD", "#0B6A0B"),
     "failed": ("检查失败", "#FDE7E9", "#A4262C"),
@@ -119,16 +115,6 @@ def run_bundled_core() -> None:
         raise SystemExit("Bundled core resources are missing.")
     sys.argv = [str(CORE_SCRIPT), *sys.argv[2:]]
     runpy.run_path(str(CORE_SCRIPT), run_name="__main__")
-
-
-def _unique_backup_path(path: Path, label: str) -> Path:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    candidate = path.with_name(f"{path.name}.{label}_{timestamp}")
-    counter = 1
-    while candidate.exists():
-        candidate = path.with_name(f"{path.name}.{label}_{timestamp}_{counter}")
-        counter += 1
-    return candidate
 
 
 def _run_core_command(args: List[str], capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -192,15 +178,6 @@ class ManagedStatus:
         return "\n".join(lines) + "\n"
 
 
-@dataclass
-class ManifestSyncResult:
-    synced: bool
-    message: str
-    manifest_path: Optional[Path] = None
-    original_content: Optional[bytes] = None
-    published_content: Optional[bytes] = None
-
-
 def resolve_codex_dir(codex_dir: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(codex_dir))).resolve()
 
@@ -228,107 +205,6 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _stable_regular_snapshot(path: Path) -> tuple[bytes, dict]:
-    """Read a regular file without accepting a symlink or concurrent rewrite."""
-    entry_before = os.lstat(path)
-    if not stat.S_ISREG(entry_before.st_mode):
-        raise OSError(f"不是普通文件: {path}")
-
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    try:
-        opened = os.fstat(descriptor)
-        identity_before = (
-            entry_before.st_dev,
-            entry_before.st_ino,
-            entry_before.st_size,
-            entry_before.st_mtime_ns,
-        )
-        identity_opened = (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            opened.st_mtime_ns,
-        )
-        if identity_before != identity_opened:
-            raise OSError(f"文件在打开前发生变化: {path}")
-
-        chunks = []
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            digest.update(chunk)
-
-        opened_after = os.fstat(descriptor)
-        entry_after = os.lstat(path)
-        identity_after = (
-            entry_after.st_dev,
-            entry_after.st_ino,
-            entry_after.st_size,
-            entry_after.st_mtime_ns,
-        )
-        identity_opened_after = (
-            opened_after.st_dev,
-            opened_after.st_ino,
-            opened_after.st_size,
-            opened_after.st_mtime_ns,
-        )
-        if identity_opened != identity_opened_after or identity_opened != identity_after:
-            raise OSError(f"文件在读取期间发生变化: {path}")
-
-        content = b"".join(chunks)
-        if len(content) != opened_after.st_size:
-            raise OSError(f"文件读取长度不一致: {path}")
-        return content, {
-            "size": opened_after.st_size,
-            "mtime_ns": opened_after.st_mtime_ns,
-            "sha256": digest.hexdigest(),
-        }
-    finally:
-        os.close(descriptor)
-
-
-def _atomic_replace_bytes(path: Path, content: bytes) -> None:
-    """Publish bytes through a same-directory temporary file."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    descriptor = None
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o600,
-        )
-        view = memoryview(content)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError(f"无法写入临时文件: {temporary}")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.replace(temporary, path)
-        if os.name != "nt":
-            directory_descriptor = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def is_whole_config_drift(output: str) -> bool:
-    return "config.toml has drifted" in output or "config.toml 已漂移" in output
 
 
 def _list_transaction_residue(codex_dir: Path) -> List[str]:
@@ -404,21 +280,11 @@ def read_model_instructions_file(config_path: Path) -> tuple[Optional[str], Opti
     return references[0], None
 
 
-def _normalize_instruction_reference(reference: str) -> str:
-    normalized = reference.replace("\\", "/").strip()
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    return normalized.lstrip("/")
-
-
 def instruction_reference_matches(actual: Optional[str], md_filename: str) -> bool:
     if actual is None:
         return False
-    expected = {md_filename, f"./{md_filename}"}
-    normalized = actual.replace("\\", "/")
-    if normalized in expected:
-        return True
-    return _normalize_instruction_reference(actual) == md_filename
+    normalized = actual.replace("\\", "/") if os.name == "nt" else actual
+    return normalized in {md_filename, f"./{md_filename}"}
 
 
 def _load_manifest(manifest_path: Path) -> dict:
@@ -427,127 +293,6 @@ def _load_manifest(manifest_path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError("部署清单根节点必须是对象")
     return data
-
-
-def _safe_manifest_filename(value: object) -> Optional[str]:
-    if not isinstance(value, str) or not value or value in {".", ".."}:
-        return None
-    if Path(value).name != value or "/" in value or "\\" in value:
-        return None
-    return value
-
-
-def _valid_portable_fingerprint(value: object) -> bool:
-    return (
-        isinstance(value, dict)
-        and isinstance(value.get("size"), int)
-        and value["size"] >= 0
-        and isinstance(value.get("mtime_ns"), int)
-        and value["mtime_ns"] >= 0
-        and isinstance(value.get("sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
-    )
-
-
-def _fingerprint_content_matches(actual: dict, expected: dict) -> bool:
-    return (
-        actual.get("size") == expected.get("size")
-        and actual.get("sha256") == expected.get("sha256")
-    )
-
-
-def _fingerprint_matches(actual: dict, expected: dict) -> bool:
-    return _fingerprint_content_matches(actual, expected) and (
-        actual.get("mtime_ns") == expected.get("mtime_ns")
-    )
-
-
-def _write_new_backup(path: Path, content: bytes, mtime_ns: int) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-        0o600,
-    )
-    try:
-        view = memoryview(content)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError(f"无法写入备份: {path}")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        try:
-            os.utime(path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
-        except NotImplementedError:
-            os.utime(path, ns=(mtime_ns, mtime_ns))
-    except Exception:
-        if descriptor >= 0:
-            os.close(descriptor)
-            descriptor = -1
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def recover_reconstructable_backups(codex_dir: str) -> List[str]:
-    """Restore a missing backup only when its bytes still exist at the managed path."""
-    target = resolve_codex_dir(codex_dir)
-    manifest_path = target / MANIFEST_FILENAME
-    notes: List[str] = []
-    try:
-        manifest = _load_manifest(manifest_path)
-    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return notes
-
-    candidates: List[tuple[str, object, object, object]] = []
-    md = manifest.get("md")
-    if isinstance(md, dict):
-        candidates.append(("提示词文件", md.get("backup"), md.get("before"), md.get("path")))
-    config = manifest.get("config")
-    if isinstance(config, dict) and config.get("changed") is True:
-        candidates.append(
-            ("config.toml", config.get("backup"), config.get("before"), config.get("path"))
-        )
-
-    for label, backup_value, expected_value, source_value in candidates:
-        backup_name = _safe_manifest_filename(backup_value)
-        source_name = _safe_manifest_filename(source_value)
-        if (
-            backup_name is None
-            or source_name is None
-            or not _valid_portable_fingerprint(expected_value)
-        ):
-            continue
-        expected = expected_value
-        backup_path = target / backup_name
-        if _path_entry_exists(backup_path):
-            continue
-        source_path = target / source_name
-        try:
-            content, source_fingerprint = _stable_regular_snapshot(source_path)
-        except OSError:
-            continue
-        if not _fingerprint_content_matches(source_fingerprint, expected):
-            continue
-
-        try:
-            _write_new_backup(backup_path, content, expected["mtime_ns"])
-            _, restored_fingerprint = _stable_regular_snapshot(backup_path)
-            if not _fingerprint_matches(restored_fingerprint, expected):
-                backup_path.unlink()
-                continue
-        except OSError as exc:
-            notes.append(f"{label}回滚备份重建失败: {exc}")
-            continue
-        notes.append(f"已从内容一致的当前文件无损重建{label}回滚备份: {backup_path}")
-    return notes
 
 
 def inspect_managed_status(codex_dir: str) -> ManagedStatus:
@@ -718,90 +463,11 @@ def _capture_core_status(codex_dir: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _config_drift_blockers(output: str) -> List[str]:
-    return [line.strip() for line in output.splitlines() if "[Blocked]" in line]
-
-
-def sync_unowned_config_fingerprint(
-    codex_dir: str,
-    managed: ManagedStatus,
-) -> ManifestSyncResult:
-    """Adopt external config changes only when this deployment never owned config."""
-    if managed.status != "deployed":
-        return ManifestSyncResult(False, "托管指令状态不完整，未同步清单")
-
-    target = resolve_codex_dir(codex_dir)
-    preview = _run_core_command(
-        _targeted_core_args(str(target), "--dry-run"),
+def _capture_core_reconcile(codex_dir: str) -> subprocess.CompletedProcess[str]:
+    return _run_core_command(
+        _targeted_core_args(codex_dir, "--reconcile-managed-state"),
         capture=True,
     )
-    blockers = _config_drift_blockers(preview.stdout or "")
-    if preview.returncode == 0:
-        return ManifestSyncResult(False, "部署核心未发现需要同步的配置漂移")
-    if len(blockers) != 1 or not is_whole_config_drift(blockers[0]):
-        return ManifestSyncResult(False, "除 config.toml 漂移外还存在其他阻塞项")
-
-    manifest_path = target / MANIFEST_FILENAME
-    config_path = target / "config.toml"
-    try:
-        original_content, _ = _stable_regular_snapshot(manifest_path)
-        manifest = json.loads(original_content.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return ManifestSyncResult(False, f"部署清单读取失败: {exc}")
-
-    config = manifest.get("config")
-    if not isinstance(config, dict):
-        return ManifestSyncResult(False, "部署清单缺少 config 段")
-    if config.get("changed") is not False or config.get("backup") is not None:
-        return ManifestSyncResult(False, "部署曾修改 config.toml，必须保留原始回滚指纹")
-    if config.get("path") != "config.toml":
-        return ManifestSyncResult(False, "部署清单中的 config 路径无效")
-
-    try:
-        _, current_fingerprint = _stable_regular_snapshot(config_path)
-        latest_manifest_content, _ = _stable_regular_snapshot(manifest_path)
-    except OSError as exc:
-        return ManifestSyncResult(False, f"配置指纹读取失败: {exc}")
-    if latest_manifest_content != original_content:
-        return ManifestSyncResult(False, "部署清单在同步前发生变化")
-
-    config["before"] = dict(current_fingerprint)
-    config["after"] = dict(current_fingerprint)
-    published_content = (
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    backup_path = target / MANIFEST_AUTO_SYNC_BACKUP
-    try:
-        _atomic_replace_bytes(backup_path, original_content)
-        _atomic_replace_bytes(manifest_path, published_content)
-    except OSError as exc:
-        return ManifestSyncResult(False, f"部署清单原子同步失败: {exc}")
-
-    return ManifestSyncResult(
-        True,
-        f"已同步非托管配置变化；清单备份: {backup_path}",
-        manifest_path,
-        original_content,
-        published_content,
-    )
-
-
-def _rollback_manifest_sync(result: ManifestSyncResult) -> str:
-    if (
-        not result.synced
-        or result.manifest_path is None
-        or result.original_content is None
-        or result.published_content is None
-    ):
-        return ""
-    try:
-        current_content, _ = _stable_regular_snapshot(result.manifest_path)
-        if current_content != result.published_content:
-            return "同步后清单再次变化，已保留现场而未自动回滚"
-        _atomic_replace_bytes(result.manifest_path, result.original_content)
-        return "部署核心复检未通过，已回滚部署清单"
-    except OSError as exc:
-        return f"部署核心复检未通过，清单回滚失败: {exc}"
 
 
 def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
@@ -813,41 +479,20 @@ def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
     notes: List[str] = []
 
     if codex_dir.strip() and status == "conflict" and managed.status == "deployed":
-        recovery_notes = recover_reconstructable_backups(codex_dir)
-        notes.extend(recovery_notes)
-        if recovery_notes:
-            core_result = _capture_core_status(codex_dir)
-            core_output = core_result.stdout or ""
-            status = classify_deployment_status(core_output, core_result.returncode)
-
-    if (
-        codex_dir.strip()
-        and status == "conflict"
-        and is_whole_config_drift(core_output)
-        and managed.status == "deployed"
-    ):
-        sync_result = sync_unowned_config_fingerprint(codex_dir, managed)
-        notes.append(sync_result.message)
-        if sync_result.synced:
+        reconciled = _capture_core_reconcile(codex_dir)
+        reconcile_output = reconciled.stdout or ""
+        if reconcile_output:
+            notes.append(reconcile_output.strip())
+        if reconciled.returncode == 0:
             verified = _capture_core_status(codex_dir)
-            verified_output = verified.stdout or ""
-            verified_status = classify_deployment_status(
-                verified_output,
-                verified.returncode,
-            )
-            if verified_status == "deployed":
-                core_output = verified_output
-                status = verified_status
-                managed = inspect_managed_status(codex_dir)
-            else:
-                notes.append(_rollback_manifest_sync(sync_result))
-                core_output = verified_output
-                status = verified_status
+            core_output = verified.stdout or ""
+            status = classify_deployment_status(core_output, verified.returncode)
+            managed = inspect_managed_status(codex_dir)
 
     if status == "conflict" and managed.status == "deployed":
         status = "degraded"
         managed.rollback_issues.append(
-            "提示词仍在正常生效，但卸载所需的原始备份或所有权证据不完整"
+            "提示词仍在正常生效，但部署核心无法自动维护回滚或所有权证据"
         )
         managed.details.append("可使用“重建回滚基线”生成新的完整部署记录")
     else:
@@ -865,19 +510,6 @@ def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
 
 def is_managed_content_conflict(status: ManagedStatus) -> bool:
     return status.is_managed_conflict
-
-
-def is_config_drift_conflict(output: str) -> bool:
-    """Legacy helper kept for repair CLI output parsing."""
-    markers = (
-        "config.toml has drifted",
-        "config.toml 已漂移",
-        "model_instructions_file",
-        "部署的 Markdown",
-        "managed markdown",
-        "Markdown 内容已变化",
-    )
-    return any(marker in output for marker in markers)
 
 
 def repair_config_conflict(
@@ -911,16 +543,15 @@ def repair_config_conflict(
 
     if managed.status == "deployed":
         print("[检查] 托管提示词正常，继续核对卸载与回滚证据。")
-        for note in recover_reconstructable_backups(str(target)):
-            print(f"[修复] {note}")
-
         core_result = _capture_core_status(str(target))
         core_output = core_result.stdout or ""
         core_status = classify_deployment_status(core_output, core_result.returncode)
-        if core_status == "conflict" and is_whole_config_drift(core_output):
-            sync_result = sync_unowned_config_fingerprint(str(target), managed)
-            print(f"[同步] {sync_result.message}")
-            if sync_result.synced:
+        if core_status == "conflict":
+            reconciled = _capture_core_reconcile(str(target))
+            reconcile_output = reconciled.stdout or ""
+            if reconcile_output:
+                print(reconcile_output, end="" if reconcile_output.endswith("\n") else "\n")
+            if reconciled.returncode == 0:
                 core_result = _capture_core_status(str(target))
                 core_output = core_result.stdout or ""
                 core_status = classify_deployment_status(
@@ -946,7 +577,7 @@ def repair_config_conflict(
         print(managed.summary_text(), end="")
         result = _run_core_command(deploy_args)
         if result.returncode == 0:
-            print("[完成] 已使用 v0.1.2 部署核心完成部署。")
+            print("[完成] 已使用 v0.1.3 部署核心完成部署。")
         return result.returncode
 
     if managed.status not in {"conflict", "deployed"}:
@@ -962,23 +593,10 @@ def repair_config_conflict(
     print("[检查] 仅校验本工具托管内容（忽略其他 config.toml 字段变化）")
     print(managed.summary_text(), end="")
 
-    config_backup = _unique_backup_path(config_path, "before_redeploy")
-    manifest_backup = _unique_backup_path(manifest_path, "before_redeploy")
-    shutil.copy2(config_path, config_backup)
-    manifest_path.replace(manifest_backup)
-    print(f"[备份] 当前配置: {config_backup}")
-    print(f"[备份] 旧部署清单: {manifest_backup}")
-
-    result = _run_core_command(deploy_args)
+    result = _run_core_command(["--repair-redeploy", *deploy_args])
     if result.returncode == 0:
-        print("[完成] 配置冲突已修复，并已由 v0.1.2 部署核心重新部署。")
+        print("[完成] 配置冲突已修复，并已由 v0.1.3 部署核心重新部署。")
         return 0
-
-    if not manifest_path.exists() and manifest_backup.exists():
-        manifest_backup.replace(manifest_path)
-        print("[回滚] 重新部署失败，旧部署清单已恢复。")
-    else:
-        print("[注意] 重新部署失败，检测到新的部署清单，已保留全部备份供检查。")
     return result.returncode or 1
 
 
@@ -1792,7 +1410,7 @@ class KeysmithGUI:
         else:
             title = "修复配置冲突"
             message = (
-                "将备份当前配置和旧部署清单，然后使用 v0.1.2 部署核心重新部署。\n\n"
+                "将备份当前配置和旧部署清单，然后使用 v0.1.3 部署核心重新部署。\n\n"
                 "现有模型、MCP 和插件配置会保留。是否继续？"
             )
         confirmed = messagebox.askyesno(title, message)
