@@ -61,6 +61,7 @@ STATUS_STYLES = {
     "checking": ("检查中...", "#E8F1FB", "#005A9E"),
     "recovery": ("事务待恢复", "#FFF4CE", "#7A5D00"),
     "conflict": ("已部署（配置冲突）", "#FDE7E9", "#A4262C"),
+    "degraded": ("已部署（回滚备份缺失）", "#FFF4CE", "#7A5D00"),
     "blocked": ("部署受阻", "#FDE7E9", "#A4262C"),
     "deployed": ("已部署", "#DFF6DD", "#0B6A0B"),
     "failed": ("检查失败", "#FDE7E9", "#A4262C"),
@@ -156,6 +157,7 @@ class ManagedStatus:
     expected_md_reference: str = ""
     residue: List[str] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
+    rollback_issues: List[str] = field(default_factory=list)
     details: List[str] = field(default_factory=list)
 
     @property
@@ -181,6 +183,9 @@ class ManagedStatus:
         if self.issues:
             lines.append("[Managed status] issues:")
             lines.extend(f"  - {issue}" for issue in self.issues)
+        if self.rollback_issues:
+            lines.append("[Managed status] rollback issues:")
+            lines.extend(f"  - {issue}" for issue in self.rollback_issues)
         if self.details:
             lines.append("[Managed status] notes:")
             lines.extend(f"  - {detail}" for detail in self.details)
@@ -422,6 +427,127 @@ def _load_manifest(manifest_path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError("部署清单根节点必须是对象")
     return data
+
+
+def _safe_manifest_filename(value: object) -> Optional[str]:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        return None
+    if Path(value).name != value or "/" in value or "\\" in value:
+        return None
+    return value
+
+
+def _valid_portable_fingerprint(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("size"), int)
+        and value["size"] >= 0
+        and isinstance(value.get("mtime_ns"), int)
+        and value["mtime_ns"] >= 0
+        and isinstance(value.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
+    )
+
+
+def _fingerprint_content_matches(actual: dict, expected: dict) -> bool:
+    return (
+        actual.get("size") == expected.get("size")
+        and actual.get("sha256") == expected.get("sha256")
+    )
+
+
+def _fingerprint_matches(actual: dict, expected: dict) -> bool:
+    return _fingerprint_content_matches(actual, expected) and (
+        actual.get("mtime_ns") == expected.get("mtime_ns")
+    )
+
+
+def _write_new_backup(path: Path, content: bytes, mtime_ns: int) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"无法写入备份: {path}")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.utime(path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
+        except NotImplementedError:
+            os.utime(path, ns=(mtime_ns, mtime_ns))
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def recover_reconstructable_backups(codex_dir: str) -> List[str]:
+    """Restore a missing backup only when its bytes still exist at the managed path."""
+    target = resolve_codex_dir(codex_dir)
+    manifest_path = target / MANIFEST_FILENAME
+    notes: List[str] = []
+    try:
+        manifest = _load_manifest(manifest_path)
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return notes
+
+    candidates: List[tuple[str, object, object, object]] = []
+    md = manifest.get("md")
+    if isinstance(md, dict):
+        candidates.append(("提示词文件", md.get("backup"), md.get("before"), md.get("path")))
+    config = manifest.get("config")
+    if isinstance(config, dict) and config.get("changed") is True:
+        candidates.append(
+            ("config.toml", config.get("backup"), config.get("before"), config.get("path"))
+        )
+
+    for label, backup_value, expected_value, source_value in candidates:
+        backup_name = _safe_manifest_filename(backup_value)
+        source_name = _safe_manifest_filename(source_value)
+        if (
+            backup_name is None
+            or source_name is None
+            or not _valid_portable_fingerprint(expected_value)
+        ):
+            continue
+        expected = expected_value
+        backup_path = target / backup_name
+        if _path_entry_exists(backup_path):
+            continue
+        source_path = target / source_name
+        try:
+            content, source_fingerprint = _stable_regular_snapshot(source_path)
+        except OSError:
+            continue
+        if not _fingerprint_content_matches(source_fingerprint, expected):
+            continue
+
+        try:
+            _write_new_backup(backup_path, content, expected["mtime_ns"])
+            _, restored_fingerprint = _stable_regular_snapshot(backup_path)
+            if not _fingerprint_matches(restored_fingerprint, expected):
+                backup_path.unlink()
+                continue
+        except OSError as exc:
+            notes.append(f"{label}回滚备份重建失败: {exc}")
+            continue
+        notes.append(f"已从内容一致的当前文件无损重建{label}回滚备份: {backup_path}")
+    return notes
 
 
 def inspect_managed_status(codex_dir: str) -> ManagedStatus:
@@ -679,12 +805,20 @@ def _rollback_manifest_sync(result: ManifestSyncResult) -> str:
 
 
 def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
-    """Use the core status, reconciling only a provably unowned config drift."""
+    """Separate active deployment health from uninstall/rollback readiness."""
     managed = inspect_managed_status(codex_dir)
     core_result = _capture_core_status(codex_dir)
     core_output = core_result.stdout or ""
     status = classify_deployment_status(core_output, core_result.returncode)
     notes: List[str] = []
+
+    if codex_dir.strip() and status == "conflict" and managed.status == "deployed":
+        recovery_notes = recover_reconstructable_backups(codex_dir)
+        notes.extend(recovery_notes)
+        if recovery_notes:
+            core_result = _capture_core_status(codex_dir)
+            core_output = core_result.stdout or ""
+            status = classify_deployment_status(core_output, core_result.returncode)
 
     if (
         codex_dir.strip()
@@ -710,9 +844,17 @@ def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
                 core_output = verified_output
                 status = verified_status
 
+    if status == "conflict" and managed.status == "deployed":
+        status = "degraded"
+        managed.rollback_issues.append(
+            "提示词仍在正常生效，但卸载所需的原始备份或所有权证据不完整"
+        )
+        managed.details.append("可使用“重建回滚基线”生成新的完整部署记录")
+    else:
+        managed.status = status
+        if status == "conflict" and not managed.issues:
+            managed.issues.append("部署核心检测到部署清单或所有权冲突")
     managed.status = status
-    if status == "conflict" and not managed.issues:
-        managed.issues.append("部署核心检测到部署清单或所有权冲突")
     managed.details.extend(note for note in notes if note)
     combined_output = core_output
     if notes:
@@ -759,12 +901,6 @@ def repair_config_conflict(
         print(managed.summary_text(), end="")
         return 1
 
-    if managed.status == "deployed":
-        print("[无需修复] 托管内容已经处于正常部署状态。")
-        print("[说明] 状态可能在点击按钮后由自动同步更新，本次按成功处理。")
-        print(managed.summary_text(), end="")
-        return 0
-
     deploy_args = ["--codex-dir", str(target), "--yes", "--lang", language]
     if md_file:
         deploy_args.extend(("--file", md_file))
@@ -772,6 +908,34 @@ def repair_config_conflict(
         deploy_args.extend(("--name", md_name))
     if skip_hooks:
         deploy_args.append("--skip-hooks-isolation")
+
+    if managed.status == "deployed":
+        print("[检查] 托管提示词正常，继续核对卸载与回滚证据。")
+        for note in recover_reconstructable_backups(str(target)):
+            print(f"[修复] {note}")
+
+        core_result = _capture_core_status(str(target))
+        core_output = core_result.stdout or ""
+        core_status = classify_deployment_status(core_output, core_result.returncode)
+        if core_status == "conflict" and is_whole_config_drift(core_output):
+            sync_result = sync_unowned_config_fingerprint(str(target), managed)
+            print(f"[同步] {sync_result.message}")
+            if sync_result.synced:
+                core_result = _capture_core_status(str(target))
+                core_output = core_result.stdout or ""
+                core_status = classify_deployment_status(
+                    core_output,
+                    core_result.returncode,
+                )
+        if core_status == "deployed":
+            print("[完成] 部署内容和回滚证据均正常，无需重新部署。")
+            return 0
+        if core_status in {"failed", "recovery"}:
+            print("[修复失败] 部署核心状态检查失败或存在待恢复事务，已停止重建。")
+            print(core_output, end="" if core_output.endswith("\n") else "\n")
+            return 1
+        print("[重建] 当前提示词仍然有效，但旧回滚证据无法完整恢复。")
+        print("[重建] 将保留当前配置副本，并以当前状态建立新的部署基线。")
 
     if managed.status == "not_deployed":
         if not _is_regular_file(config_path):
@@ -785,7 +949,7 @@ def repair_config_conflict(
             print("[完成] 已使用 v0.1.2 部署核心完成部署。")
         return result.returncode
 
-    if managed.status != "conflict":
+    if managed.status not in {"conflict", "deployed"}:
         print("[修复失败] 当前状态无法自动修复，请使用高级操作查看详情。")
         print(managed.summary_text(), end="")
         return 1
@@ -1554,15 +1718,23 @@ class KeysmithGUI:
         if self.repair_button is None:
             return
         managed_conflict = status == "conflict" and is_managed_content_conflict(managed)
-        visible = status in {"deployed", "conflict"}
+        rollback_degraded = status == "degraded"
+        visible = status in {"deployed", "conflict", "degraded"}
         if visible:
+            if rollback_degraded:
+                button_text = "重建回滚基线"
+            elif managed_conflict:
+                button_text = "修复配置冲突并重新部署"
+            else:
+                button_text = "重新部署"
+            warning_action = managed_conflict or rollback_degraded
             self.repair_button.configure(
-                text=("修复配置冲突并重新部署" if managed_conflict else "重新部署"),
-                background=("#FFF4CE" if managed_conflict else "#E8F1FB"),
-                activebackground=("#FCE8A6" if managed_conflict else "#D5E8F7"),
-                foreground=("#7A5D00" if managed_conflict else "#005A9E"),
-                activeforeground=("#7A5D00" if managed_conflict else "#005A9E"),
-                highlightbackground=("#E6C95C" if managed_conflict else "#8ABBDD"),
+                text=button_text,
+                background=("#FFF4CE" if warning_action else "#E8F1FB"),
+                activebackground=("#FCE8A6" if warning_action else "#D5E8F7"),
+                foreground=("#7A5D00" if warning_action else "#005A9E"),
+                activeforeground=("#7A5D00" if warning_action else "#005A9E"),
+                highlightbackground=("#E6C95C" if warning_action else "#8ABBDD"),
             )
             if not self.repair_button.winfo_manager():
                 self.repair_button.pack(fill=tk.X, pady=(10, 0))
@@ -1572,9 +1744,8 @@ class KeysmithGUI:
     def _redeploy_or_repair(self) -> None:
         managed = self.current_managed_status
         if (
-            self.current_deployment_status == "conflict"
+            self.current_deployment_status in {"conflict", "degraded"}
             and managed is not None
-            and is_managed_content_conflict(managed)
         ):
             self._repair_and_redeploy()
             return
@@ -1611,11 +1782,20 @@ class KeysmithGUI:
         if not codex_dir or not Path(codex_dir).expanduser().is_dir():
             messagebox.showerror("目录不存在", "请先选择发生冲突的 Codex 配置目录。")
             return
-        confirmed = messagebox.askyesno(
-            "修复配置冲突",
-            "将备份当前配置和旧部署清单，然后使用 v0.1.2 部署核心重新部署。\n\n"
-            "现有模型、MCP 和插件配置会保留。是否继续？",
-        )
+        if self.current_deployment_status == "degraded":
+            title = "重建回滚基线"
+            message = (
+                "当前提示词仍然正常生效，但原始回滚备份不完整。\n\n"
+                "继续后会备份当前配置和旧清单，并以当前状态建立新的回滚基线。"
+                "原先已经丢失的旧内容不会被恢复。是否继续？"
+            )
+        else:
+            title = "修复配置冲突"
+            message = (
+                "将备份当前配置和旧部署清单，然后使用 v0.1.2 部署核心重新部署。\n\n"
+                "现有模型、MCP 和插件配置会保留。是否继续？"
+            )
+        confirmed = messagebox.askyesno(title, message)
         if confirmed:
             self._start_command(self._build_repair_command())
 
