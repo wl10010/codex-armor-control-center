@@ -667,6 +667,7 @@ class KeysmithGUI:
         self.runtime_text = tk.StringVar(value=runtime)
         self.status_text = tk.StringVar(value="就绪")
         self.status_badge: Optional[tk.Label] = None
+        self.status_repair_button: Optional[tk.Button] = None
         self.status_refresh_button: Optional[ttk.Button] = None
         self.repair_button: Optional[tk.Button] = None
         self.advanced_frame: Optional[tk.Frame] = None
@@ -806,6 +807,22 @@ class KeysmithGUI:
             font=(self.ui_font, 9, "bold"),
         )
         self.status_badge.pack(side=tk.LEFT, padx=(0, 8))
+        self.status_repair_button = tk.Button(
+            status_row,
+            text="立即修复",
+            command=self._repair_and_redeploy,
+            background="#A4262C",
+            activebackground="#8E1E2D",
+            foreground="#FFFFFF",
+            activeforeground="#FFFFFF",
+            disabledforeground="#E0E0E0",
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=12,
+            pady=4,
+            font=(self.ui_font, 9, "bold"),
+            cursor="hand2",
+        )
         self.status_refresh_button = ttk.Button(
             status_row,
             text="刷新",
@@ -1201,10 +1218,15 @@ class KeysmithGUI:
     def _set_quick_action_state(self, state: str) -> None:
         self.quick_deploy_button.configure(state=state)
         self.quick_uninstall_button.configure(state=state)
+        if self.status_repair_button is not None:
+            self.status_repair_button.configure(state=state)
         if self.repair_button is not None:
             self.repair_button.configure(state=state)
 
     def _quick_deploy(self) -> None:
+        if self.current_deployment_status in {"conflict", "degraded"}:
+            self._repair_and_redeploy()
+            return
         confirmed = messagebox.askyesno(
             "确认一键部署",
             "将使用当前配置执行部署。是否继续？",
@@ -1294,6 +1316,11 @@ class KeysmithGUI:
             self.status_refresh_pending = True
             return
         self._apply_deployment_status("checking")
+        if (
+            self.status_repair_button is not None
+            and self.status_repair_button.winfo_manager()
+        ):
+            self.status_repair_button.pack_forget()
         if self.status_refresh_button is not None:
             self.status_refresh_button.configure(state=tk.DISABLED)
         self.status_check_active = True
@@ -1333,6 +1360,30 @@ class KeysmithGUI:
         self._set_deployment_status(*STATUS_STYLES[status])
 
     def _update_repair_button(self, status: str, managed: ManagedStatus) -> None:
+        automatic_repair = status in {"conflict", "degraded"}
+        self.quick_deploy_button.configure(
+            text="一键修复部署" if automatic_repair else "一键部署"
+        )
+        self.quick_uninstall_button.configure(
+            text="修复后卸载" if automatic_repair else "一键卸载"
+        )
+        if self.status_repair_button is not None:
+            if automatic_repair:
+                conflict = status == "conflict"
+                self.status_repair_button.configure(
+                    text="立即修复" if conflict else "重建基线",
+                    background="#A4262C" if conflict else "#E6A700",
+                    activebackground="#8E1E2D" if conflict else "#C58F00",
+                    state=(tk.DISABLED if self.process is not None else tk.NORMAL),
+                )
+                if not self.status_repair_button.winfo_manager():
+                    self.status_repair_button.pack(
+                        side=tk.LEFT,
+                        padx=(0, 8),
+                        before=self.status_refresh_button,
+                    )
+            elif self.status_repair_button.winfo_manager():
+                self.status_repair_button.pack_forget()
         if self.repair_button is None:
             return
         managed_conflict = status == "conflict" and is_managed_content_conflict(managed)
