@@ -494,7 +494,7 @@ def inspect_reconciled_status(codex_dir: str) -> tuple[str, ManagedStatus]:
         managed.rollback_issues.append(
             "提示词仍在正常生效，但部署核心无法自动维护回滚或所有权证据"
         )
-        managed.details.append("可使用“重建回滚基线”生成新的完整部署记录")
+        managed.details.append("可使用“修复部署记录”重新建立完整的部署和卸载记录")
     else:
         managed.status = status
         if status == "conflict" and not managed.issues:
@@ -565,8 +565,8 @@ def repair_config_conflict(
             print("[修复失败] 部署核心状态检查失败或存在待恢复事务，已停止重建。")
             print(core_output, end="" if core_output.endswith("\n") else "\n")
             return 1
-        print("[重建] 当前提示词仍然有效，但旧回滚证据无法完整恢复。")
-        print("[重建] 将保留当前配置副本，并以当前状态建立新的部署基线。")
+        print("[修复] 当前提示词仍然有效，但旧的部署记录不完整。")
+        print("[修复] 将保留当前配置副本，并重新建立部署和卸载记录。")
 
     if managed.status == "not_deployed":
         if not _is_regular_file(config_path):
@@ -1371,7 +1371,7 @@ class KeysmithGUI:
             if automatic_repair:
                 conflict = status == "conflict"
                 self.status_repair_button.configure(
-                    text="立即修复" if conflict else "重建基线",
+                    text="立即修复" if conflict else "修复记录",
                     background="#A4262C" if conflict else "#E6A700",
                     activebackground="#8E1E2D" if conflict else "#C58F00",
                     state=(tk.DISABLED if self.process is not None else tk.NORMAL),
@@ -1391,7 +1391,7 @@ class KeysmithGUI:
         visible = status in {"deployed", "conflict", "degraded"}
         if visible:
             if rollback_degraded:
-                button_text = "重建回滚基线"
+                button_text = "修复部署记录并重新部署"
             elif managed_conflict:
                 button_text = "修复配置冲突并重新部署"
             else:
@@ -1452,10 +1452,10 @@ class KeysmithGUI:
             messagebox.showerror("目录不存在", "请先选择发生冲突的 Codex 配置目录。")
             return
         if self.current_deployment_status == "degraded":
-            title = "重建回滚基线"
+            title = "修复部署记录"
             message = (
-                "当前提示词仍然正常生效，但原始回滚备份不完整。\n\n"
-                "继续后会备份当前配置和旧清单，并以当前状态建立新的回滚基线。"
+                "当前提示词仍然正常生效，但原来的部署记录不完整。\n\n"
+                "继续后会备份当前配置和旧清单，并重新建立可用的部署和卸载记录。"
                 "原先已经丢失的旧内容不会被恢复。是否继续？"
             )
         else:
